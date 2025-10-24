@@ -95,9 +95,31 @@ src/
 
 ## 🚀 Quick Start
 
-### 1. Configure
+### 1. Set Up Credentials
 
-Edit `config.toml`:
+For security, use environment variables:
+
+```bash
+# Copy the template
+cp .env.example .env
+
+# Edit .env with your mnemonic
+nano .env
+```
+
+Add your mnemonic to `.env`:
+
+```bash
+CELESTIA_MNEMONIC=your twenty four word mnemonic phrase here
+```
+
+**Important:** `.env` is in `.gitignore` and will not be committed!
+
+See [`docs/ENV_SETUP.md`](docs/ENV_SETUP.md) for detailed setup instructions.
+
+### 2. Configure Settings
+
+Edit `config.toml` (no secrets here!):
 
 ```toml
 [sampling]

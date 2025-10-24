@@ -5,6 +5,7 @@ mod otlp;
 mod metrics;
 mod da;
 mod storage;
+mod crypto;
 
 use axum::{routing::post, Router};
 use std::{

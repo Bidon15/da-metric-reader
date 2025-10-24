@@ -23,3 +23,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 chrono = "0.4"
 hex = "0.4"
+bip39 = "2.1"
+slip10_ed25519 = "0.1"
+celestia-client = "0.2"
+dotenvy = "0.15"
