@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use flate2::read::GzDecoder;
 use crate::types::{AppState, NormalizedMetric, MetricValue};
-use crate::otlp::{normalize_metrics, print_normalized_metrics};
+use super::{normalize_metrics, print_normalized_metrics};
 
 /// Accept OTLP/HTTP metrics (JSON or protobuf) and extract DAS metrics
 pub async fn handle_metrics(

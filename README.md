@@ -1,286 +1,320 @@
-# OTLP Metrics Reader
+# DA Reader - DAS Node Monitoring for 2Nice DFP
 
-A Rust-based OTLP (OpenTelemetry Protocol) HTTP metrics receiver that normalizes incoming metrics into an easy-to-process format.
+A Rust-based monitoring agent for Celestia Data Availability Sampling (DAS) nodes that collects health metrics, generates verifiable uptime attestations, and posts them to Celestia DA for the Delegation Foundation Program (DFP).
 
-## Features
+## 🎯 Purpose
 
-✅ **Receives OTLP Metrics** via HTTP (port 4318)  
-✅ **Supports Multiple Formats**: Protobuf and JSON  
-✅ **Handles Compression**: Automatic gzip decompression  
-✅ **Normalizes Metrics**: Converts complex OTLP structures into simple, processable format  
-✅ **Extracts All Data**: Resource attributes, labels, timestamps, and values  
-✅ **JSON Export**: Serialize normalized metrics to JSON  
-✅ **Built-in Examples**: Shows how to filter, aggregate, and alert on metrics
+Provide **cryptographically verifiable proof** that DA node operators are maintaining uptime commitments by:
 
-## Quick Start
+- Sampling node health metrics every 30 seconds
+- Posting individual samples to Celestia DA (Layer 1: detailed audit trail)
+- Generating batched attestations every 10 minutes with ZK proofs (Layer 2: efficient verification)
+
+This enables a **trust-minimized Service Level Market** where node performance can be objectively measured and verified.
+
+## ✨ Features
+
+✅ **OTLP Metrics Ingestion** - Receives OpenTelemetry metrics from DAS nodes  
+✅ **Health Sampling** - Every 30s checks if chain head is advancing  
+✅ **Ring Buffer** - Maintains sliding window of samples for batching  
+✅ **Batch Generation** - Every 10min creates attestation with uptime percentage  
+✅ **Cryptographic Hashing** - BLAKE3 hash of bitmap for integrity  
+✅ **File Persistence** - Saves samples, batches, and bitmaps locally  
+✅ **DA Posting Ready** - Prepared for posting to Celestia DA  
+✅ **ZK Proof Ready** - Structure prepared for Groth16 proof generation
+
+## 🏗️ Architecture
+
+### Code Structure
+
+```
+src/
+├── main.rs              - Entry point & initialization
+├── config.rs            - Configuration from config.toml
+├── types.rs             - Data models & shared types
+├── utils.rs             - Helper functions
+│
+├── otlp/                - OpenTelemetry Protocol handling
+│   ├── mod.rs           - Parser & normalizer
+│   └── handlers.rs      - HTTP endpoint handler
+│
+├── metrics/             - Metrics collection & processing
+│   ├── sampler.rs       - Every-30s health checks
+│   └── batch.rs         - Every-10min batch generation
+│
+├── da/                  - Data Availability layer (TODO)
+│   └── mod.rs           - Celestia DA posting logic
+│
+└── storage/             - Persistence layer
+    └── mod.rs           - File I/O operations
+```
+
+### Data Flow
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    DAS Node                             │
+│  Exposes OTLP/HTTP metrics (head height, headers, etc.) │
+└──────────────────┬──────────────────────────────────────┘
+                   │ POST /v1/metrics (every 5-10s)
+                   ▼
+┌─────────────────────────────────────────────────────────┐
+│              DA Reader (this service)                   │
+│  Port: 4318                                             │
+│                                                          │
+│  [OTLP Handler] ──▶ Parse & normalize metrics           │
+│         │                                                │
+│         ▼                                                │
+│  [Sampler - 30s tick]                                   │
+│    • Check head advancement                             │
+│    • Check headers advancing                            │
+│    • Check data freshness                               │
+│    • Generate bit (0/1)                                 │
+│    • Store in ring buffer                               │
+│    • Save to samples.json                               │
+│    • POST to DA Layer 1 ◀── TODO                        │
+│         │                                                │
+│         ▼                                                │
+│  [Batch Generator - 10min]                              │
+│    • Collect ring buffer                                │
+│    • Calculate uptime %                                 │
+│    • Hash bitmap (BLAKE3)                               │
+│    • Save batch.json + bitmap.hex                       │
+│    • Generate ZK proof ◀── TODO                         │
+│    • POST to DA Layer 2 ◀── TODO                        │
+└─────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+        ┌────────────────────┐
+        │   Celestia DA      │
+        │                    │
+        │  Layer 1: Samples  │
+        │  Layer 2: Batches  │
+        └────────────────────┘
+```
+
+## 🚀 Quick Start
+
+### 1. Configure
+
+Edit `config.toml`:
+
+```toml
+[sampling]
+tick_secs = 30              # Sample every 30 seconds
+max_staleness_secs = 120    # Max metric age
+grace_period_secs = 45      # Grace period for head advancement
+
+[da_posting]
+enabled = false             # Enable when ready to post to DA
+post_every_sample = true    # Post each sample (Layer 1)
+
+[batching]
+window_secs = 600           # Generate batch every 10 minutes
+
+[metrics]
+head_metric = "das_sampled_chain_head"
+headers_metric = "das_total_sampled_headers"
+min_increment = 1
+
+[celestia]
+node_url = "http://localhost:26658"
+namespace = "0x2N1CE"
+poster_mode = "mock"        # or "real"
+
+[proofs]
+enabled = false
+threshold_percent = 0.95    # 95% uptime threshold
+```
+
+### 2. Run
 
 ```bash
-# Build the project
-cargo build
+# Build
+cargo build --release
 
-# Run the server
-cargo run
+# Run
+cargo run --release
 
-# Server will listen on http://0.0.0.0:4318/v1/metrics
+# You'll see:
+# 🚀 Listening for OTLP/HTTP on http://0.0.0.0:4318
+# 📊 Sampler will tick every 30 seconds
+# 📦 Batches will be generated every 600 seconds (10 minutes)
 ```
 
-## Sending Metrics
+### 3. Point Your DAS Node
 
-The server accepts OTLP metrics from any OpenTelemetry SDK. For example:
+Configure your DAS node to export metrics via OTLP/HTTP to `http://localhost:4318/v1/metrics`.
 
-### From an OpenTelemetry Application
+## 📊 Two-Layer DA Posting Strategy
 
-```javascript
-// JavaScript/Node.js example
-const {
-  MeterProvider,
-  PeriodicExportingMetricReader,
-} = require("@opentelemetry/sdk-metrics");
-const {
-  OTLPMetricExporter,
-} = require("@opentelemetry/exporter-metrics-otlp-http");
+### Layer 1: Individual Samples (Every 30s)
 
-const exporter = new OTLPMetricExporter({
-  url: "http://localhost:4318/v1/metrics",
-});
+**What gets posted:**
 
-const meterProvider = new MeterProvider({
-  readers: [new PeriodicExportingMetricReader({ exporter })],
-});
-
-const meter = meterProvider.getMeter("example");
-const counter = meter.createCounter("http_requests_total");
-
-counter.add(1, { method: "GET", route: "/api/users" });
-```
-
-### Manual cURL Test (with JSON)
-
-```bash
-curl -X POST http://localhost:4318/v1/metrics \
-  -H "Content-Type: application/json" \
-  -d '{
-    "resourceMetrics": [{
-      "resource": {
-        "attributes": [{
-          "key": "service.name",
-          "value": {"stringValue": "test-service"}
-        }]
-      },
-      "scopeMetrics": [{
-        "metrics": [{
-          "name": "test.counter",
-          "sum": {
-            "dataPoints": [{
-              "asInt": "42",
-              "timeUnixNano": "1234567890000000000"
-            }]
-          }
-        }]
-      }]
-    }]
-  }'
-```
-
-## Normalized Metric Structure
-
-The server converts OTLP metrics into a simplified `NormalizedMetric` structure:
-
-```rust
-struct NormalizedMetric {
-    name: String,                              // e.g., "http.server.duration"
-    metric_type: String,                       // "Gauge", "Sum", "Histogram", "Summary"
-    value: MetricValue,                        // Int, Double, Histogram, or Summary
-    attributes: HashMap<String, String>,       // Labels like {"method": "GET", "status": "200"}
-    resource_attributes: HashMap<String, String>, // {"service.name": "my-api"}
-    scope_name: Option<String>,                // Instrumentation library name
-    scope_version: Option<String>,             // Instrumentation library version
-    time_unix_nano: Option<u64>,              // Timestamp in nanoseconds
-    start_time_unix_nano: Option<u64>,        // Start time for cumulative metrics
+```json
+{
+  "type": "sample",
+  "timestamp": 1729785600,
+  "ok": true,
+  "reason": "+2 blocks"
 }
 ```
 
-### Metric Value Types
+**Purpose:** Complete audit trail - anyone can replay the entire history
 
-```rust
-enum MetricValue {
-    Int(i64),                    // Counter or gauge with integer value
-    Double(f64),                 // Counter or gauge with floating-point value
-    Histogram {                  // Distribution of observations
-        count: u64,
-        sum: Option<f64>,
-        buckets: Vec<HistogramBucket>,
-    },
-    Summary {                    // Pre-calculated quantiles
-        count: u64,
-        sum: f64,
-        quantiles: Vec<SummaryQuantile>,
-    },
+### Layer 2: Batch Attestations (Every 10min)
+
+**What gets posted:**
+
+```json
+{
+  "type": "batch_attestation",
+  "window": { "start": 1729785600, "end": 1729786200 },
+  "summary": {
+    "n": 20,
+    "good": 19,
+    "threshold": 19,
+    "uptime_percent": 95.0
+  },
+  "bitmap_hash": "a1b2c3d4e5f6...",
+  "zk_proof": "0x..."
 }
 ```
 
-## Processing Examples
+**Purpose:** Efficient verification with cryptographic guarantees
 
-The server includes several built-in examples (see `process_metrics()` function):
+See [`docs/DA_POSTING_STRATEGY.md`](docs/DA_POSTING_STRATEGY.md) for detailed explanation.
 
-### 1. Group Metrics by Service
+## 📁 Output Files
 
-```rust
-for metric in metrics {
-    if let Some(service) = metric.resource_attributes.get("service.name") {
-        println!("Metric {} from service {}", metric.name, service);
-    }
-}
-```
+The service generates these files in the `data/` directory:
 
-### 2. Calculate Histogram Statistics
+- **`samples.json`** - All individual health samples
+- **`bitmap.hex`** - Binary bitmap of uptime (01 = ok, 00 = not ok)
+- **`batch.json`** - Batch metadata with uptime statistics
 
-```rust
-if let MetricValue::Histogram { count, sum, buckets } = &metric.value {
-    if let Some(s) = sum {
-        let avg = s / (*count as f64);
-        println!("Average: {:.2}", avg);
-
-        // Calculate p95
-        let p95_threshold = ((*count as f64) * 0.95) as u64;
-        let mut cumulative = 0;
-        for bucket in buckets {
-            cumulative += bucket.count;
-            if cumulative >= p95_threshold {
-                println!("p95: ≤ {:.2}", bucket.upper_bound);
-                break;
-            }
-        }
-    }
-}
-```
-
-### 3. Alert on Thresholds
-
-```rust
-if metric.name.contains("duration") {
-    if let MetricValue::Double(val) = metric.value {
-        if val > 1000.0 {
-            eprintln!("⚠️  High latency: {:.2}ms", val);
-        }
-    }
-}
-```
-
-### 4. Filter by Labels
-
-```rust
-let get_requests: Vec<_> = metrics
-    .iter()
-    .filter(|m| m.attributes.get("http.method") == Some(&"GET".to_string()))
-    .collect();
-```
-
-### 5. Export as JSON
-
-```rust
-let json = serde_json::to_string_pretty(&metrics)?;
-println!("{}", json);
-```
-
-## Output Example
-
-When metrics are received, you'll see output like:
+Example batch output:
 
 ```
-=== Received 3 metrics at 1729785600 ===
+================================================================================
+📦 BATCH GENERATED FOR ZK PROOF
+================================================================================
+🕐 Time Window:
+   Start: 1729785600 (2024-10-24 12:00:00 UTC)
+   End:   1729786200 (2024-10-24 12:10:00 UTC)
 
-📊 Metric: http.server.duration
-   Type: Histogram
-   Count: 150
-   Sum: 45230.50
-   Buckets:
-     ≤ 100.00: 80 observations
-     ≤ 500.00: 130 observations
-     ≤ 1000.00: 145 observations
-     ≤ 5000.00: 150 observations
-   Labels:
-     http.method: GET
-     http.route: /api/users
-     http.status_code: 200
-   Resource:
-     service.name: my-api
-     host.name: server-1
-   Scope: opentelemetry.instrumentation.http (1.0.0)
+📊 Statistics:
+   Total Samples:     20
+   Successful (OK):   19
+   Failed:            1
+   Uptime:            95.00%
+   Threshold:         19 (95%)
+   Meets Threshold:   ✅ YES
 
-📊 Metric: http.server.active_requests
-   Type: Gauge
-   Value: 12
-   Labels:
-     http.method: GET
-   Resource:
-     service.name: my-api
-     host.name: server-1
-
-=== Processing Metrics ===
-Service 'my-api' sent 3 metrics
-📈 http.server.duration - Average: 301.54, Total samples: 150
-  → p95: ≤ 1000.00
-=== Processing Complete ===
+🔐 Cryptographic Data:
+   Bitmap Hash:       d4a7f92b8c3e1d6f...
+   Bitmap Length:     20 bytes
+================================================================================
 ```
 
-## Use Cases
+## 🔍 Sampling Logic
 
-1. **Development/Testing**: Local OTLP endpoint for testing OpenTelemetry instrumentation
-2. **Metrics Gateway**: Receive metrics from multiple services and forward to databases
-3. **Monitoring**: Alert on specific metric patterns or thresholds
-4. **Data Processing**: Transform and enrich metrics before storage
-5. **Analytics**: Calculate custom statistics and aggregations
-6. **Debugging**: Inspect raw OTLP metrics in a readable format
+The sampler evaluates three conditions every 30 seconds:
 
-## Integration Ideas
+1. **Staleness Check** - Is data fresh (< 120s old)?
+2. **Head Advancement** - Has chain head increased?
+3. **Headers Advancement** - Have sampled headers increased?
 
-- **Forward to Prometheus**: Convert and send via remote write API
-- **Store in TimescaleDB**: Insert normalized metrics as time-series data
-- **Stream to Kafka**: Publish metrics for downstream processing
-- **Send to DataDog/New Relic**: Convert format and forward
-- **Custom Dashboards**: Export JSON for visualization tools
-- **Machine Learning**: Feed normalized data into ML pipelines
+All three must pass for the sample to be marked as "OK" (bit = 1).
 
-## Dependencies
+See [`docs/SAMPLING_LOGIC.md`](docs/SAMPLING_LOGIC.md) for detailed logic.
 
-- `axum` - Web framework
-- `tokio` - Async runtime
-- `prost` - Protobuf serialization
-- `opentelemetry-proto` - OTLP protocol definitions
-- `serde` & `serde_json` - JSON serialization
-- `flate2` - Gzip decompression
-- `tracing` - Logging
+## 📚 Documentation
 
-## Architecture
+All detailed documentation is in the [`docs/`](docs/) directory:
 
-```
-┌─────────────┐      OTLP/HTTP       ┌──────────────┐
-│ OpenTelemetry│ ─────Protobuf/JSON──▶│              │
-│   SDK        │      (gzipped)       │  da-reader   │
-└─────────────┘                       │              │
-                                      │  1. Decode   │
-┌─────────────┐                       │  2. Normalize│
-│ Application │ ─────────────────────▶│  3. Process  │
-└─────────────┘      Port 4318        │  4. Export   │
-                                      └──────────────┘
-                                            │
-                                            ▼
-                               ┌─────────────────────────┐
-                               │ • Print to stdout       │
-                               │ • Export as JSON        │
-                               │ • Forward to DB         │
-                               │ • Alert on thresholds   │
-                               │ • Calculate statistics  │
-                               └─────────────────────────┘
+- **[PRD.md](docs/PRD.md)** - Product Requirements Document
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - System architecture
+- **[DA_POSTING_STRATEGY.md](docs/DA_POSTING_STRATEGY.md)** - Two-layer DA posting approach
+- **[SAMPLING_LOGIC.md](docs/SAMPLING_LOGIC.md)** - How health checks work
+- **[METRICS_IMPLEMENTATION.md](docs/METRICS_IMPLEMENTATION.md)** - Implementation details
+- **[DATA_FLOW.md](docs/DATA_FLOW.md)** - Data flow diagrams
+- **[LOGGING.md](docs/LOGGING.md)** - Logging strategy
+- **[OUTPUT_EXAMPLE.md](docs/OUTPUT_EXAMPLE.md)** - Sample outputs
+- **[USAGE_EXAMPLES.md](docs/USAGE_EXAMPLES.md)** - Code examples
+
+## 🛠️ Development
+
+### Testing with shorter intervals
+
+For faster testing, modify `config.toml`:
+
+```toml
+[sampling]
+tick_secs = 10          # Sample every 10s instead of 30s
+
+[batching]
+window_secs = 60        # Batch every 1 min instead of 10 min
 ```
 
-## Further Reading
+This gives you 6 samples per batch instead of waiting 10 minutes.
 
-- See `USAGE_EXAMPLES.md` for more code examples
-- [OpenTelemetry Protocol Spec](https://github.com/open-telemetry/opentelemetry-proto)
-- [OTLP Metrics](https://opentelemetry.io/docs/specs/otlp/#otlphttp-request)
+### Simulating failures
 
-## License
+To test failure detection:
+
+1. Stop sending metrics (staleness triggers)
+2. Send metrics with same head value (advancement fails)
+3. Send metrics with same headers value (headers check fails)
+
+## 🔮 Roadmap
+
+### Phase 1: Core Metrics ✅
+
+- [x] OTLP ingestion
+- [x] Health sampling
+- [x] Batch generation
+- [x] File persistence
+
+### Phase 2: DA Posting (In Progress)
+
+- [ ] Celestia DA client integration
+- [ ] Post samples to DA (Layer 1)
+- [ ] Post batches to DA (Layer 2)
+
+### Phase 3: ZK Proofs
+
+- [ ] Groth16 proof generation (arkworks)
+- [ ] Prove: Σ bits ≥ threshold
+- [ ] Include proof in batch attestation
+
+### Phase 4: Dashboard
+
+- [ ] Web UI (Axum + Askama)
+- [ ] Show recent batches
+- [ ] Display DA commitments
+- [ ] Verify proof status
+
+## 🔧 Technology Stack
+
+- **Rust** - Systems programming language
+- **Tokio** - Async runtime
+- **Axum** - Web framework
+- **OpenTelemetry** - Metrics protocol
+- **BLAKE3** - Cryptographic hashing
+- **Serde** - Serialization
+- **Tracing** - Structured logging
+
+Future:
+
+- **arkworks** - ZK proof generation
+- **celestia-types** - Celestia DA API
+
+## 🤝 Contributing
+
+This is part of the 2Nice Delegation Foundation Program (DFP) for measuring and verifying DA node operator performance.
+
+## 📄 License
 
 MIT

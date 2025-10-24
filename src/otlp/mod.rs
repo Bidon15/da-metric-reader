@@ -1,3 +1,7 @@
+mod handlers;
+
+pub use handlers::handle_metrics;
+
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use std::collections::HashMap;

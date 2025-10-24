@@ -1,11 +1,10 @@
 mod config;
 mod types;
-mod otlp;
-mod handlers;
-mod sampler;
-mod batch;
-mod storage;
 mod utils;
+mod otlp;
+mod metrics;
+mod da;
+mod storage;
 
 use axum::{routing::post, Router};
 use std::{
@@ -19,9 +18,8 @@ use tracing::info;
 
 use config::Config;
 use types::{AppState, DasMetrics};
-use handlers::handle_metrics;
-use sampler::run_sampler;
-use batch::run_batch_generator;
+use otlp::handle_metrics;
+use metrics::{run_sampler, run_batch_generator};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
