@@ -1,0 +1,27 @@
+[sampling]
+tick_secs = 30          # Sample health every 30 seconds
+max_staleness_secs = 120
+grace_period_secs = 45  # Allow up to 45s for head to advance (~7-8 Celestia blocks)
+
+[da_posting]
+enabled = false          # Enable when ready to post to Celestia DA
+post_every_sample = true  # Post each sample immediately (detailed history for replay)
+                         # Batches + ZK proofs are ALSO posted separately (verifiable attestation)
+
+[batching]
+window_secs = 600       # Generate batches every 10 minutes (for ZK proofs)
+# This is separate from DA posting - batches are for proof generation
+
+[metrics]
+head_metric = "das_sampled_chain_head"
+headers_metric = "das_total_sampled_headers"
+min_increment = 1
+
+[celestia]
+node_url = "http://localhost:26658"
+namespace = "0x2N1CE"
+poster_mode = "mock"                # or "real"
+
+[proofs]
+enabled = false
+threshold_percent = 0.95

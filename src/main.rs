@@ -5,14 +5,113 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 };
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use prost::Message;
-use std::{collections::HashMap, io::Read, net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
-use tokio::net::TcpListener;
-use tracing::{info, warn, debug};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs,
+    io::Read,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{net::TcpListener, time::interval};
+use tracing::{info, warn, debug, error};
 use flate2::read::GzDecoder;
 use serde::{Serialize, Deserialize};
 
-#[derive(Clone, Default)]
-struct AppState;
+/// Configuration loaded from config.toml
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    sampling: SamplingConfig,
+    metrics: MetricsConfig,
+    da_posting: DaPostingConfig,
+    batching: BatchingConfig,
+    #[allow(dead_code)] // Will be used for DA posting later
+    celestia: CelestiaConfig,
+    proofs: ProofsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SamplingConfig {
+    tick_secs: u64,
+    max_staleness_secs: u64,
+    grace_period_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaPostingConfig {
+    enabled: bool,
+    post_every_sample: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BatchingConfig {
+    window_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MetricsConfig {
+    head_metric: String,
+    headers_metric: String,
+    min_increment: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Will be used for DA posting later
+struct CelestiaConfig {
+    node_url: String,
+    namespace: String,
+    poster_mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProofsConfig {
+    #[allow(dead_code)] // Will be used for ZK proofs later
+    enabled: bool,
+    threshold_percent: f64,
+}
+
+impl Config {
+    fn load() -> anyhow::Result<Self> {
+        let content = fs::read_to_string("config.toml")?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    }
+}
+
+/// Stores the latest DAS metrics
+#[derive(Debug, Clone, Default)]
+struct DasMetrics {
+    head: Option<i64>,
+    headers: Option<i64>,
+    last_update: Option<u64>, // Unix timestamp in seconds
+}
+
+/// Application state shared across handlers and background tasks
+#[derive(Clone)]
+struct AppState {
+    config: Arc<Config>,
+    das_metrics: Arc<Mutex<DasMetrics>>,
+    ring_buffer: Arc<Mutex<VecDeque<SampleBit>>>,
+    samples: Arc<Mutex<Vec<Sample>>>,
+}
+
+/// A single sample bit with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SampleBit {
+    timestamp: u64,
+    ok: bool,
+    reason: String,
+}
+
+/// Raw sample data point
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Sample {
+    timestamp: u64,
+    head: Option<i64>,
+    headers: Option<i64>,
+    ok: bool,
+    reason: String,
+}
 
 /// Normalized metric structure for easier processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,21 +168,65 @@ struct SummaryQuantile {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Load configuration
+    let config = Arc::new(Config::load()?);
+    info!("Loaded config: {:?}", config);
+    
+    // Create data directory if it doesn't exist
+    fs::create_dir_all("data")?;
+    
+    // Initialize shared state
+    let state = AppState {
+        config: config.clone(),
+        das_metrics: Arc::new(Mutex::new(DasMetrics::default())),
+        ring_buffer: Arc::new(Mutex::new(VecDeque::new())),
+        samples: Arc::new(Mutex::new(Vec::new())),
+    };
+    
+    // Spawn background sampler task
+    let sampler_state = state.clone();
+    tokio::spawn(async move {
+        run_sampler(sampler_state).await;
+    });
+    
+    // Spawn background batch generator task
+    let batch_state = state.clone();
+    tokio::spawn(async move {
+        run_batch_generator(batch_state).await;
+    });
+    
+    // Start HTTP server
     let app = Router::new()
         .route("/v1/metrics", post(handle_metrics))
-        .with_state(AppState);
+        .with_state(state);
 
     let addr: SocketAddr = "0.0.0.0:4318".parse()?;
-    info!("Listening for OTLP/HTTP on http://{addr}");
+    info!("🚀 Listening for OTLP/HTTP on http://{addr}");
+    info!("📊 Sampler will tick every {} seconds", config.sampling.tick_secs);
+    
+    if config.da_posting.enabled {
+        if config.da_posting.post_every_sample {
+            info!("📡 DA posting: ENABLED - Will post each sample to Celestia DA");
+        } else {
+            info!("📡 DA posting: ENABLED - Will post batched samples to Celestia DA");
+        }
+    } else {
+        info!("📡 DA posting: DISABLED - Samples will be stored locally only");
+    }
+    
+    info!("📦 Batches (for ZK proofs) will be generated every {} seconds ({} minutes)", 
+          config.batching.window_secs, 
+          config.batching.window_secs / 60);
+    
     let listener = TcpListener::bind(&addr).await?;
     axum::serve(listener, app.into_make_service()).await?;
 
     Ok(())
 }
 
-/// Accept OTLP/HTTP metrics (JSON or protobuf) and print them
+/// Accept OTLP/HTTP metrics (JSON or protobuf) and extract DAS metrics
 async fn handle_metrics(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> (StatusCode, axum::body::Bytes) {
@@ -101,19 +244,19 @@ async fn handle_metrics(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     
-    info!("Content-Type: {}, Content-Encoding: {}, Body size: {} bytes", 
-          content_type, content_encoding, body.len());
+    debug!("Content-Type: {}, Content-Encoding: {}, Body size: {} bytes", 
+           content_type, content_encoding, body.len());
     
     let is_json = content_type.contains("json");
     
     // Decompress body if gzipped
     let decoded_body = if content_encoding.contains("gzip") {
-        info!("Decompressing gzipped body");
+        debug!("Decompressing gzipped body");
         let mut decoder = GzDecoder::new(&body[..]);
         let mut decompressed = Vec::new();
         match decoder.read_to_end(&mut decompressed) {
             Ok(size) => {
-                info!("Decompressed {} bytes to {} bytes", body.len(), size);
+                debug!("Decompressed {} bytes to {} bytes", body.len(), size);
                 axum::body::Bytes::from(decompressed)
             }
             Err(e) => {
@@ -130,7 +273,7 @@ async fn handle_metrics(
         // Try JSON decoding
         match serde_json::from_slice::<ExportMetricsServiceRequest>(&decoded_body) {
         Ok(req) => {
-                info!("Successfully decoded JSON metrics");
+                debug!("Successfully decoded JSON metrics");
                 Ok(req)
             }
             Err(e) => {
@@ -143,7 +286,7 @@ async fn handle_metrics(
         // Try protobuf decoding
         match ExportMetricsServiceRequest::decode(decoded_body.clone()) {
             Ok(req) => {
-                info!("Successfully decoded protobuf metrics");
+                debug!("Successfully decoded protobuf metrics");
                 Ok(req)
         }
         Err(e) => {
@@ -151,7 +294,7 @@ async fn handle_metrics(
                 // If protobuf fails, try JSON as fallback
                 match serde_json::from_slice::<ExportMetricsServiceRequest>(&decoded_body) {
                     Ok(req) => {
-                        info!("Successfully decoded JSON metrics (fallback)");
+                        debug!("Successfully decoded JSON metrics (fallback)");
                         Ok(req)
                     }
                     Err(e2) => {
@@ -166,10 +309,21 @@ async fn handle_metrics(
     
     if let Ok(req) = result {
         let normalized = normalize_metrics(req);
-        print_normalized_metrics(&normalized);
         
-        // Example: Process specific metrics
-        process_metrics(&normalized);
+        // Extract DAS-specific metrics and store them
+        let das_updated = extract_das_metrics(&normalized, &state);
+        
+        // Log successful metric ingestion
+        if das_updated {
+            info!("📥 Received OTLP metrics from DAS node - Stored internally");
+        } else {
+            debug!("📥 Received {} OTLP metrics (no DAS-specific metrics found)", normalized.len());
+        }
+        
+        // Only print detailed metrics in debug mode
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            print_normalized_metrics(&normalized);
+        }
     }
 
     // Reply with appropriate response format
@@ -344,170 +498,415 @@ fn extract_number_value(
     })
 }
 
-/// Print normalized metrics in a readable format
+/// Print normalized metrics in a readable format (debug mode only)
 fn print_normalized_metrics(metrics: &[NormalizedMetric]) {
+    debug!("Received {} normalized metrics", metrics.len());
+    
+    for metric in metrics {
+        match &metric.value {
+            MetricValue::Int(i) => {
+                debug!("  {} [{}] = {}", metric.name, metric.metric_type, i);
+            }
+            MetricValue::Double(d) => {
+                debug!("  {} [{}] = {:.2}", metric.name, metric.metric_type, d);
+            }
+            MetricValue::Histogram { count, sum, .. } => {
+                if let Some(s) = sum {
+                    debug!("  {} [Histogram] count={}, sum={:.2}", metric.name, count, s);
+                } else {
+                    debug!("  {} [Histogram] count={}", metric.name, count);
+                }
+            }
+            MetricValue::Summary { count, sum, .. } => {
+                debug!("  {} [Summary] count={}, sum={:.2}", metric.name, count, sum);
+            }
+        }
+    }
+}
+
+
+/// Extract DAS-specific metrics and update state
+/// Returns true if any DAS metrics were updated
+fn extract_das_metrics(metrics: &[NormalizedMetric], state: &AppState) -> bool {
+    let config = &state.config.metrics;
+    let mut das_metrics = state.das_metrics.lock().unwrap();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
     
-    println!("\n=== Received {} metrics at {} ===", metrics.len(), now);
+    let mut updated = false;
     
     for metric in metrics {
-        println!("\n📊 Metric: {}", metric.name);
-        println!("   Type: {}", metric.metric_type);
-        
-        match &metric.value {
-            MetricValue::Int(i) => println!("   Value: {}", i),
-            MetricValue::Double(d) => println!("   Value: {:.2}", d),
-            MetricValue::Histogram { count, sum, buckets } => {
-                println!("   Count: {}", count);
-                if let Some(s) = sum {
-                    println!("   Sum: {:.2}", s);
-                }
-                if !buckets.is_empty() {
-                    println!("   Buckets:");
-                    for bucket in buckets {
-                        println!("     ≤ {:.2}: {} observations", bucket.upper_bound, bucket.count);
-                    }
-                }
-            }
-            MetricValue::Summary { count, sum, quantiles } => {
-                println!("   Count: {}", count);
-                println!("   Sum: {:.2}", sum);
-                if !quantiles.is_empty() {
-                    println!("   Quantiles:");
-                    for q in quantiles {
-                        println!("     p{:.2}: {:.2}", q.quantile * 100.0, q.value);
-                    }
-                }
+        // Extract das_sampled_chain_head
+        if metric.name == config.head_metric {
+            if let MetricValue::Int(value) = metric.value {
+                das_metrics.head = Some(value);
+                das_metrics.last_update = Some(now);
+                debug!("Updated DAS head: {}", value);
+                updated = true;
             }
         }
         
-        if !metric.attributes.is_empty() {
-            println!("   Labels:");
-            for (key, value) in &metric.attributes {
-                println!("     {}: {}", key, value);
-            }
-        }
-        
-        if !metric.resource_attributes.is_empty() {
-            println!("   Resource:");
-            for (key, value) in &metric.resource_attributes {
-                println!("     {}: {}", key, value);
-            }
-        }
-        
-        if let (Some(scope_name), Some(scope_version)) = (&metric.scope_name, &metric.scope_version) {
-            if !scope_name.is_empty() {
-                println!("   Scope: {} ({})", scope_name, scope_version);
+        // Extract das_total_sampled_headers
+        if metric.name == config.headers_metric {
+            if let MetricValue::Int(value) = metric.value {
+                das_metrics.headers = Some(value);
+                debug!("Updated DAS headers: {}", value);
+                updated = true;
             }
         }
     }
     
-    println!("\n✅ You can also export these metrics as JSON:");
-    if let Ok(json) = serde_json::to_string_pretty(&metrics) {
-        println!("{}", json);
+    updated
+}
+
+/// Background task: samples metrics at fixed intervals
+async fn run_sampler(state: AppState) {
+    let tick_duration = Duration::from_secs(state.config.sampling.tick_secs);
+    let mut ticker = interval(tick_duration);
+    let window_size = (state.config.batching.window_secs / state.config.sampling.tick_secs) as usize;
+    
+    // Previous values to track advancement
+    let mut prev_head: Option<i64> = None;
+    let mut prev_headers: Option<i64> = None;
+    
+    info!("🔄 Sampler started (tick every {}s, window size: {})", 
+          state.config.sampling.tick_secs, window_size);
+    
+    loop {
+        ticker.tick().await;
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Read current metrics
+        let (current_head, current_headers, last_update) = {
+            let das_metrics = state.das_metrics.lock().unwrap();
+            (das_metrics.head, das_metrics.headers, das_metrics.last_update)
+        };
+        
+        // Check staleness
+        let is_stale = match last_update {
+            Some(update_time) => {
+                let age = now.saturating_sub(update_time);
+                age > state.config.sampling.max_staleness_secs
+            }
+            None => true,
+        };
+        
+        // Check head advancement and reason
+        let (head_advanced, head_reason) = match (prev_head, current_head) {
+            (Some(prev), Some(curr)) => {
+                let diff = curr - prev;
+                // Head advanced: good!
+                if diff >= state.config.metrics.min_increment {
+                    (true, format!("+{} blocks", diff))
+                } else {
+                    // Head didn't advance, but check if data is fresh
+                    // If metrics were just updated, give it a pass
+                    // (Data is fresh, just sampled at wrong moment)
+                    let data_age = last_update.map(|u| now.saturating_sub(u)).unwrap_or(999);
+                    if data_age <= state.config.sampling.grace_period_secs {
+                        // Fresh data, can't judge advancement yet
+                        (true, format!("fresh data (age={}s)", data_age))
+                    } else {
+                        (false, format!("head stuck at {}", curr))
+                    }
+                }
+            }
+            (None, Some(_)) => {
+                // First reading, consider it ok
+                (true, "first sample".to_string())
+            }
+            _ => (false, "no head data".to_string()),
+        };
+        
+        // Optional: Check if headers advanced
+        let headers_advanced = match (prev_headers, current_headers) {
+            (Some(prev), Some(curr)) => curr > prev,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        
+        // Determine if this tick is "ok"
+        let (ok, reason) = if is_stale {
+            (false, format!("stale (age > {}s)", state.config.sampling.max_staleness_secs))
+        } else if !head_advanced {
+            (false, head_reason)
+        } else if !headers_advanced {
+            (false, format!("headers not advancing"))
+        } else {
+            (true, head_reason)
+        };
+        
+        // Create sample
+        let sample = Sample {
+            timestamp: now,
+            head: current_head,
+            headers: current_headers,
+            ok,
+            reason: reason.clone(),
+        };
+        
+        let sample_bit = SampleBit {
+            timestamp: now,
+            ok,
+            reason: reason.clone(),
+        };
+        
+        // Store sample
+        {
+            let mut samples = state.samples.lock().unwrap();
+            samples.push(sample.clone());
+            
+            // Save to file periodically
+            if let Err(e) = save_samples(&samples) {
+                error!("Failed to save samples: {}", e);
+            } else {
+                debug!("💾 Saved {} samples to data/samples.json", samples.len());
+            }
+        }
+        
+        // Add to ring buffer
+        {
+            let mut ring_buffer = state.ring_buffer.lock().unwrap();
+            ring_buffer.push_back(sample_bit.clone());
+            
+            // Maintain window size
+            while ring_buffer.len() > window_size {
+                ring_buffer.pop_front();
+            }
+        }
+        
+        // Post sample to DA if enabled (detailed history)
+        if state.config.da_posting.enabled && state.config.da_posting.post_every_sample {
+            // TODO: Implement actual DA posting
+            // post_sample_to_da(&sample_bit, &state).await;
+            info!("📡 Posted sample to Celestia DA: ok={}, timestamp={}", sample_bit.ok, sample_bit.timestamp);
+        }
+        
+        // Show all samples at info level for better DevX
+        let buffer_len = {
+            let buffer = state.ring_buffer.lock().unwrap();
+            buffer.len()
+        };
+        
+        if ok {
+            info!(
+                "✅ Sample OK - Head: {:?} ({}), Headers: {:?} | Buffer: {}/{} samples",
+                current_head,
+                reason,
+                current_headers,
+                buffer_len,
+                window_size
+            );
+        } else {
+            warn!(
+                "❌ Sample FAILED - {} | Head: {:?}, Headers: {:?}",
+                reason,
+                current_head,
+                current_headers
+            );
+        }
+        
+        // Update previous values for next iteration
+        prev_head = current_head;
+        prev_headers = current_headers;
     }
 }
 
-/// Example function showing how to process normalized metrics
-fn process_metrics(metrics: &[NormalizedMetric]) {
-    println!("\n=== Processing Metrics ===");
+/// Background task: generates batches at fixed intervals (for ZK proofs)
+async fn run_batch_generator(state: AppState) {
+    let batch_duration = Duration::from_secs(state.config.batching.window_secs);
+    let mut ticker = interval(batch_duration);
     
-    // Example 1: Group by service name
-    let mut metrics_by_service: HashMap<String, Vec<&NormalizedMetric>> = HashMap::new();
-    for metric in metrics {
-        if let Some(service) = metric.resource_attributes.get("service.name") {
-            metrics_by_service
-                .entry(service.clone())
-                .or_insert_with(Vec::new)
-                .push(metric);
-        }
-    }
+    info!("📦 Batch generator started (every {}s = {} min) for ZK proof generation", 
+          state.config.batching.window_secs,
+          state.config.batching.window_secs / 60);
     
-    for (service, service_metrics) in &metrics_by_service {
-        info!("Service '{}' sent {} metrics", service, service_metrics.len());
-    }
+    // Skip the first immediate tick
+    ticker.tick().await;
     
-    // Example 2: Calculate statistics for histograms
-    for metric in metrics {
-        if let MetricValue::Histogram { count, sum, buckets } = &metric.value {
-            if let Some(s) = sum {
-                let avg = s / (*count as f64);
-                info!(
-                    "📈 {} - Average: {:.2}, Total samples: {}",
-                    metric.name, avg, count
-                );
-                
-                // Calculate approximate percentiles from buckets
-                if !buckets.is_empty() {
-                    let p95_threshold = ((*count as f64) * 0.95) as u64;
-                    let mut cumulative = 0u64;
-                    
-                    for bucket in buckets {
-                        cumulative += bucket.count;
-                        if cumulative >= p95_threshold {
-                            info!("  → p95: ≤ {:.2}", bucket.upper_bound);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Example 3: Alert on high values
-    for metric in metrics {
-        // Example: Alert on high response times (>1 second)
-        if metric.name.contains("duration") || metric.name.contains("latency") {
-            match &metric.value {
-                MetricValue::Double(val) if *val > 1000.0 => {
-                    let labels_str: Vec<String> = metric.attributes
-                        .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect();
-                    warn!(
-                        "⚠️  High latency: {:.2}ms for {} [{}]",
-                        val, metric.name, labels_str.join(", ")
-                    );
-                }
-                _ => {}
-            }
+    loop {
+        ticker.tick().await;
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Get the ring buffer
+        let bits: Vec<SampleBit> = {
+            let ring_buffer = state.ring_buffer.lock().unwrap();
+            ring_buffer.iter().cloned().collect()
+        };
+        
+        if bits.is_empty() {
+            warn!("No samples in ring buffer yet, skipping batch");
+            continue;
         }
         
-        // Example: Alert on error counts (threshold: 50)
-        // Adjust this threshold based on your needs
-        if metric.name.contains("error") || metric.name.contains("failure") {
-            if let MetricValue::Int(count) = metric.value {
-                if count > 50 {
-                    let labels_str: Vec<String> = metric.attributes
-                        .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect();
-                    warn!(
-                        "⚠️  Error count is high: {} for {} [{}]",
-                        count, metric.name, labels_str.join(", ")
-                    );
+        // Generate batch
+        let n = bits.len();
+        let good = bits.iter().filter(|b| b.ok).count();
+        let threshold = ((n as f64) * state.config.proofs.threshold_percent).ceil() as usize;
+        
+        let window_start = bits.first().map(|b| b.timestamp).unwrap_or(now);
+        let window_end = bits.last().map(|b| b.timestamp).unwrap_or(now);
+        
+        // Create bitmap (1 = ok, 0 = not ok)
+        let bitmap_bytes: Vec<u8> = bits.iter().map(|b| if b.ok { 1 } else { 0 }).collect();
+        
+        // Hash the bitmap
+        let bitmap_hash = blake3::hash(&bitmap_bytes);
+        let bitmap_hash_hex = bitmap_hash.to_hex();
+        
+        // Create batch
+        let batch = Batch {
+            n,
+            good,
+            threshold,
+            bitmap_hash: bitmap_hash_hex.to_string(),
+            window: TimeWindow {
+                start: window_start,
+                end: window_end,
+            },
+        };
+        
+        // Save batch
+        if let Err(e) = save_batch(&batch) {
+            error!("Failed to save batch: {}", e);
+        }
+        
+        // Save bitmap
+        if let Err(e) = save_bitmap(&bitmap_bytes) {
+            error!("Failed to save bitmap: {}", e);
+        }
+        
+        // Print what would be posted to DA
+        let uptime_percent = (good as f64 / n as f64) * 100.0;
+        let meets_threshold = good >= threshold;
+        
+        println!("\n{}", "=".repeat(80));
+        println!("📦 BATCH GENERATED FOR ZK PROOF");
+        println!("   This batch is for generating ZK proofs of uptime");
+        println!("   (Individual samples are posted to DA separately)");
+        println!("{}", "=".repeat(80));
+        println!("🕐 Time Window:");
+        println!("   Start: {} ({})", window_start, format_timestamp(window_start));
+        println!("   End:   {} ({})", window_end, format_timestamp(window_end));
+        println!("\n📊 Statistics:");
+        println!("   Total Samples:     {}", n);
+        println!("   Successful (OK):   {}", good);
+        println!("   Failed:            {}", n - good);
+        println!("   Uptime:            {:.2}%", uptime_percent);
+        println!("   Threshold:         {} ({:.0}%)", threshold, state.config.proofs.threshold_percent * 100.0);
+        println!("   Meets Threshold:   {} {}", 
+                 if meets_threshold { "✅ YES" } else { "❌ NO" },
+                 if meets_threshold { "" } else { "(Would not generate proof)" });
+        println!("\n🔐 Cryptographic Data:");
+        println!("   Bitmap Hash:       {}", batch.bitmap_hash);
+        println!("   Bitmap Length:     {} bytes", bitmap_bytes.len());
+        println!("\n📄 Files Written:");
+        println!("   - data/batch.json");
+        println!("   - data/bitmap.hex");
+        println!("   - data/samples.json");
+        println!("\n💾 What would be posted to DA:");
+        
+        let da_payload = serde_json::json!({
+            "batch": {
+                "n": n,
+                "good": good,
+                "threshold": threshold,
+                "bitmap_hash": batch.bitmap_hash,
+                "window": {
+                    "start": window_start,
+                    "end": window_end,
                 }
-            }
+            },
+            "namespace": state.config.celestia.namespace,
+            "timestamp": now,
+        });
+        
+        println!("{}", serde_json::to_string_pretty(&da_payload).unwrap());
+        println!("{}\n", "=".repeat(80));
+        
+        info!(
+            "✅ Batch generated: n={}, good={}, threshold={}, uptime={:.2}%",
+            n, good, threshold, uptime_percent
+        );
+        
+        if meets_threshold {
+            info!("🎉 Uptime threshold MET ({:.0}%) - Batch ready for ZK proof generation", 
+                  state.config.proofs.threshold_percent * 100.0);
+        } else {
+            warn!("⚠️  Uptime threshold NOT MET - ZK proof would fail (need {:.0}%, got {:.2}%)", 
+                  state.config.proofs.threshold_percent * 100.0,
+                  uptime_percent);
+        }
+        
+        info!("💾 Batch files saved to data/ directory (batch.json, bitmap.hex)");
+        
+        // TODO: Generate ZK proof
+        info!("🔐 TODO: Generate ZK proof from this batch");
+        // let proof = generate_zk_proof(&batch, &bitmap_bytes).await;
+        
+        // Post batch + proof to DA (verifiable attestation)
+        if state.config.da_posting.enabled {
+            info!("✅ Individual samples already posted to DA (detailed history)");
+            info!("📡 TODO: Post batch summary + ZK proof to DA (verifiable attestation)");
+            // TODO: Implement batch posting to DA
+            // post_batch_to_da(&batch, &proof, &state).await;
+        } else {
+            info!("📡 DA posting disabled - samples and batches stored locally only");
         }
     }
-    
-    // Example 4: Filter metrics by label
-    let http_get_metrics: Vec<_> = metrics
-        .iter()
-        .filter(|m| {
-            m.attributes
-                .get("http.method")
-                .map(|method| method == "GET")
-                .unwrap_or(false)
-        })
-        .collect();
-    
-    if !http_get_metrics.is_empty() {
-        info!("Found {} GET request metrics", http_get_metrics.len());
-    }
-    
-    println!("=== Processing Complete ===\n");
+}
+
+/// Batch structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Batch {
+    n: usize,
+    good: usize,
+    threshold: usize,
+    bitmap_hash: String,
+    window: TimeWindow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TimeWindow {
+    start: u64,
+    end: u64,
+}
+
+/// Save samples to file
+fn save_samples(samples: &[Sample]) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(samples)?;
+    fs::write("data/samples.json", json)?;
+    Ok(())
+}
+
+/// Save batch to file
+fn save_batch(batch: &Batch) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(batch)?;
+    fs::write("data/batch.json", json)?;
+    Ok(())
+}
+
+/// Save bitmap to hex file
+fn save_bitmap(bitmap: &[u8]) -> anyhow::Result<()> {
+    let hex: String = bitmap.iter().map(|b| format!("{:02x}", b)).collect();
+    fs::write("data/bitmap.hex", hex)?;
+    Ok(())
+}
+
+/// Format Unix timestamp to human-readable string
+fn format_timestamp(ts: u64) -> String {
+    use chrono::{DateTime, Utc};
+    let dt = DateTime::<Utc>::from_timestamp(ts as i64, 0)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+    dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
